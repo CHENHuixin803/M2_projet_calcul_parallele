@@ -1,6 +1,8 @@
 """
-生命游戏（MPI版本 - 行分解 / Row Decomposition）
-终极修复版：修复图案初始化错位、恢复UI图案显示、NumPy矢量化满血加速
+Jeu de la vie (Version MPI - Décomposition par lignes)
+Ce script implémente le jeu de la vie de Conway en utilisant MPI.
+La grille globale est divisée en bandes horizontales (lignes) réparties entre les processus.
+Supporte le mode interactif (Pygame) et le mode benchmark (performances pures).
 """
 import os, io, base64, time, sys
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
@@ -8,7 +10,15 @@ import pygame as pg, numpy as np
 from mpi4py import MPI
 
 class Grille:
+    """
+    Classe représentant la grille locale de l'automate cellulaire pour un processus MPI.
+    Gère la décomposition par lignes et les cellules fantômes (ghost cells) pour la topologie torique.
+    """
     def __init__(self, rank, nbp, dim, init_pattern=None, color_life=pg.Color("black"), color_dead=pg.Color("white")):
+        """
+        Initialise la grille locale pour le processus courant.
+        Calcule la répartition des lignes et positionne le motif initial si fourni.
+        """
         self.rank, self.nbp, self.global_dim = rank, nbp, dim
         ny_loc = dim[0] // nbp + (1 if rank < dim[0] % nbp else 0)
         self.y_start = ny_loc * rank + (dim[0] % nbp if rank >= dim[0] % nbp else 0)
@@ -19,7 +29,7 @@ class Grille:
             self.cells = np.zeros(self.dimensions, dtype=np.uint8)
             for v in init_pattern:
                 y_glob, x_glob = v[0], v[1]
-                # 【修复】完全抛弃危险的 % 取模逻辑，严格判断行范围
+                # Vérifie si la ligne globale appartient à ce processus
                 if self.y_start <= y_glob < self.y_start + self.ny_loc:
                     self.cells[y_glob - self.y_start + 1, x_glob] = 1
         else:
@@ -27,18 +37,25 @@ class Grille:
         self.col_life, self.col_dead = color_life, color_dead
 
     def compute_next_iteration(self, globCom):
+        """
+        Calcule la prochaine génération de cellules.
+        1. Échange MPI des lignes fantômes avec les voisins haut/bas.
+        2. Calcul vectorisé NumPy ultra-rapide des règles du jeu de la vie.
+        Retourne : (temps_de_calcul, temps_de_communication)
+        """
         t0 = MPI.Wtime()
         top_neighbor, bot_neighbor = (self.rank - 1) % self.nbp, (self.rank + 1) % self.nbp
         
+        # Communication MPI : échange des frontières
         globCom.Sendrecv(self.cells[1, :].copy(), dest=top_neighbor, sendtag=10, recvbuf=self.cells[self.ny_loc+1, :], source=bot_neighbor, recvtag=10)
         globCom.Sendrecv(self.cells[self.ny_loc, :].copy(), dest=bot_neighbor, sendtag=11, recvbuf=self.cells[0, :], source=top_neighbor, recvtag=11)
         
         t1 = MPI.Wtime()
-        # NumPy 矢量化加速
+        # Calcul vectorisé NumPy
         nx = self.global_dim[1]
         padded = np.empty((self.ny_loc + 2, nx + 2), dtype=np.uint8)
         padded[:, 1:-1] = self.cells
-        padded[:, 0] = self.cells[:, -1]
+        padded[:, 0] = self.cells[:, -1] # Wrap torique gauche/droite
         padded[:, -1] = self.cells[:, 0]
 
         neighbors = (padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:] +
@@ -55,12 +72,17 @@ class Grille:
         return (t2 - t1), (t1 - t0)
 
 class App:
+    """
+    Classe gérant l'affichage graphique de la grille avec Pygame.
+    Instanciée uniquement par le processus Rank 0.
+    """
     def __init__(self, geometry, global_dim, grid):
         self.grid, self.global_dim = grid, global_dim
         self.size_x, self.size_y = geometry[1] // global_dim[1], geometry[0] // global_dim[0]
         self.draw_color = pg.Color('lightgrey') if (self.size_x > 4 and self.size_y > 4) else None
         self.width, self.height = global_dim[1] * self.size_x, global_dim[0] * self.size_y
         self.screen = pg.display.set_mode((self.width, self.height))
+        
     def draw(self, global_cells):
         [self.screen.fill(self.grid.col_dead if global_cells[i,j]==0 else self.grid.col_life, (self.size_x*j, self.height - self.size_y*(i + 1), self.size_x, self.size_y)) for i in range(self.global_dim[0]) for j in range(self.global_dim[1])]
         if self.draw_color is not None:
@@ -86,12 +108,15 @@ if __name__ == '__main__':
     }
 
     if not benchmark_mode:
+        # ==========================================
+        # Mode Interactif (Pygame UI)
+        # ==========================================
         choice = sys.argv[1] if len(sys.argv) > 1 else 'glider'
         resx = int(sys.argv[2]) if len(sys.argv) > 3 else 800
         resy = int(sys.argv[3]) if len(sys.argv) > 3 else 800
         
         if choice not in dico_patterns:
-            if rank == 0: print("图案未知")
+            if rank == 0: print("Pattern inconnu.")
             MPI.Finalize()
             sys.exit(1)
             
@@ -112,6 +137,8 @@ if __name__ == '__main__':
             t1 = time.time()
             t_comp, t_comm = grid.compute_next_iteration(globCom)
             local_real_cells = grid.cells[1 : grid.ny_loc + 1, :].flatten()
+            
+            # Gatherv pour collecter les lignes
             globCom.Gatherv(local_real_cells, [global_cells_flat, recvcounts, displacements, MPI.BYTE], root=0)
 
             t2 = time.time()
@@ -119,12 +146,14 @@ if __name__ == '__main__':
                 appli.draw(global_cells_flat.reshape(global_dim))
                 for event in pg.event.get():
                     if event.type == pg.QUIT: mustContinue_arr[0] = 0
-                print(f"MPI 计算与通信: {t2-t1:2.2e} s | 渲染: {time.time()-t2:2.2e} s\r", end='', flush=True)
+                print(f"MPI Compute+Comm: {t2-t1:2.2e} s | Render: {time.time()-t2:2.2e} s\r", end='', flush=True)
             globCom.Bcast(mustContinue_arr, root=0)
         if rank == 0: pg.quit()
 
     else:
-        # Benchmark 模式
+        # ==========================================
+        # Mode Benchmark (Performance pure)
+        # ==========================================
         ny, nx, n_iter = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
         seed = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] != '--dump-grid' else 42
         dump_grid = '--dump-grid' in sys.argv
