@@ -1,6 +1,7 @@
 """
-生命游戏（MPI版本 - 二维块分解 Block Decomposition）
-终极修复版：修复图案初始化、恢复UI图案显示、NumPy矢量化满血加速
+Jeu de la vie (Version MPI - Décomposition en blocs 2D)
+Ce script utilise une topologie cartésienne MPI 2D pour diviser la grille en sous-grilles.
+Méthode d'échange de halos (ghost cells) en 2 étapes pour couvrir les diagonales.
 """
 import os, io, base64, time, sys
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
@@ -8,15 +9,25 @@ import pygame as pg, numpy as np
 from mpi4py import MPI
 
 class Grille:
+    """
+    Classe représentant le bloc local (sous-grille) de l'automate.
+    Gère la décomposition 2D cartésienne et les cellules fantômes sur les 4 côtés.
+    """
     def __init__(self, cart_comm, dim, init_pattern=None, color_life=pg.Color("black"), color_dead=pg.Color("white")):
+        """
+        Initialise le bloc local en fonction des coordonnées cartésiennes du processus.
+        """
         self.cart_comm = cart_comm
         self.rank = cart_comm.rank
         self.global_dim = dim
+        
+        # Dimensions de la topologie et coordonnées du processus courant
         topo_dims = cart_comm.dims
         coords = cart_comm.Get_coords(self.rank)
         py, px = topo_dims[0], topo_dims[1]
         cy, cx = coords[0], coords[1]
         
+        # Calcul de la répartition 2D
         base_y, rem_y = dim[0] // py, dim[0] % py
         self.ny_loc = base_y + (1 if cy < rem_y else 0)
         self.y_start = cy * base_y + (cy if cy < rem_y else rem_y)
@@ -30,6 +41,7 @@ class Grille:
         if init_pattern is not None:
             self.cells = np.zeros(self.dimensions, dtype=np.uint8)
             for v in init_pattern:
+                # Filtrage : On ne garde que les cellules appartenant à ce bloc 2D
                 if (self.y_start <= v[0] < self.y_start + self.ny_loc) and (self.x_start <= v[1] < self.x_start + self.nx_loc):
                     self.cells[v[0] - self.y_start + 1, v[1] - self.x_start + 1] = 1
         else:
@@ -37,13 +49,21 @@ class Grille:
         self.col_life, self.col_dead = color_life, color_dead
 
     def compute_next_iteration(self):
+        """
+        Calcule la prochaine génération avec échange MPI en 2 étapes.
+        Étape 1 : Échange vertical (haut/bas)
+        Étape 2 : Échange horizontal (gauche/droite) incluant les diagonales reçues à l'étape 1.
+        """
         t0 = MPI.Wtime()
+        # Détermination des voisins via MPI.Cart_comm.Shift
         top, bot = self.cart_comm.Shift(0, 1) 
         left, right = self.cart_comm.Shift(1, 1) 
         
+        # Étape 1 : Communication Y (Haut / Bas)
         self.cart_comm.Sendrecv(self.cells[1, 1:self.nx_loc+1].copy(), dest=top, sendtag=10, recvbuf=self.cells[self.ny_loc+1, 1:self.nx_loc+1], source=bot, recvtag=10)
         self.cart_comm.Sendrecv(self.cells[self.ny_loc, 1:self.nx_loc+1].copy(), dest=bot, sendtag=11, recvbuf=self.cells[0, 1:self.nx_loc+1], source=top, recvtag=11)
                                 
+        # Étape 2 : Communication X (Gauche / Droite) - on échange les colonnes entières !
         recv_right_col, recv_left_col = np.empty(self.ny_loc + 2, dtype=np.uint8), np.empty(self.ny_loc + 2, dtype=np.uint8)
         self.cart_comm.Sendrecv(self.cells[:, 1].copy(), dest=left, sendtag=12, recvbuf=recv_right_col, source=right, recvtag=12)
         self.cells[:, self.nx_loc + 1] = recv_right_col 
@@ -51,7 +71,7 @@ class Grille:
         self.cells[:, 0] = recv_left_col 
 
         t1 = MPI.Wtime()
-        # NumPy 矢量化加速，利用四周边界极其优雅！
+        # Calcul vectorisé NumPy (sans aucune condition de bord grâce aux cellules fantômes 2D)
         neighbors = (self.cells[:-2, :-2] + self.cells[:-2, 1:-1] + self.cells[:-2, 2:] +
                      self.cells[1:-1, :-2] +                        self.cells[1:-1, 2:] +
                      self.cells[2:, :-2]  + self.cells[2:, 1:-1]  + self.cells[2:, 2:])
@@ -66,12 +86,14 @@ class Grille:
         return (t2 - t1), (t1 - t0)
 
 class App:
+    """ Gestion de l'affichage UI avec Pygame (Rank 0 uniquement) """
     def __init__(self, geometry, global_dim, grid):
         self.grid, self.global_dim = grid, global_dim
         self.size_x, self.size_y = geometry[1] // global_dim[1], geometry[0] // global_dim[0]
         self.draw_color = pg.Color('lightgrey') if (self.size_x > 4 and self.size_y > 4) else None
         self.width, self.height = global_dim[1] * self.size_x, global_dim[0] * self.size_y
         self.screen = pg.display.set_mode((self.width, self.height))
+        
     def draw(self, global_cells):
         [self.screen.fill(self.grid.col_dead if global_cells[i,j]==0 else self.grid.col_life, (self.size_x*j, self.height - self.size_y*(i + 1), self.size_x, self.size_y)) for i in range(self.global_dim[0]) for j in range(self.global_dim[1])]
         if self.draw_color is not None:
@@ -82,6 +104,8 @@ class App:
 if __name__ == '__main__':
     globCom = MPI.COMM_WORLD.Dup() 
     nbp, rank = globCom.size, globCom.rank         
+    
+    # Création automatique de la topologie 2D optimisée
     dims = MPI.Compute_dims(nbp, 2)
     cart_comm = globCom.Create_cart(dims=dims, periods=(True, True), reorder=False)
 
@@ -100,12 +124,15 @@ if __name__ == '__main__':
     }
 
     if not benchmark_mode:
+        # ==========================================
+        # Mode Interactif (Pygame UI)
+        # ==========================================
         choice = sys.argv[1] if len(sys.argv) > 1 else 'glider'
         resx = int(sys.argv[2]) if len(sys.argv) > 3 else 800
         resy = int(sys.argv[3]) if len(sys.argv) > 3 else 800
         
         if choice not in dico_patterns:
-            if rank == 0: print("图案未知")
+            if rank == 0: print("Pattern inconnu.")
             MPI.Finalize()
             sys.exit(1)
             
@@ -127,10 +154,13 @@ if __name__ == '__main__':
             t1 = time.time()
             grid.compute_next_iteration()
             local_real_cells = grid.cells[1 : grid.ny_loc+1, 1 : grid.nx_loc+1].flatten()
+            
+            # Gatherv pour collecter tous les blocs
             globCom.Gatherv(local_real_cells, [global_cells_flat, recvcounts, displacements, MPI.BYTE], root=0)
             
             t2 = time.time()
             if rank == 0:
+                # Reconstitution de la grille 2D à partir des blocs rectangulaires
                 offset = 0
                 for r in range(nbp):
                     ny_r, nx_r = dims_list[r]
@@ -140,15 +170,18 @@ if __name__ == '__main__':
                     chunk = global_cells_flat[offset : offset + ny_r*nx_r].reshape((ny_r, nx_r))
                     global_cells_2d[y_st : y_st+ny_r, x_st : x_st+nx_r] = chunk
                     offset += ny_r*nx_r
+                    
                 appli.draw(global_cells_2d)
                 for event in pg.event.get():
                     if event.type == pg.QUIT: mustContinue_arr[0] = 0
-                print(f"MPI 计算与通信: {t2-t1:2.2e} s | 渲染: {time.time()-t2:2.2e} s\r", end='', flush=True)
+                print(f"MPI Compute+Comm: {t2-t1:2.2e} s | Render: {time.time()-t2:2.2e} s\r", end='', flush=True)
             globCom.Bcast(mustContinue_arr, root=0)
         if rank == 0: pg.quit()
 
     else:
-        # Benchmark 模式
+        # ==========================================
+        # Mode Benchmark (Performance pure)
+        # ==========================================
         ny, nx, n_iter = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
         seed = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] != '--dump-grid' else 42
         dump_grid = '--dump-grid' in sys.argv
